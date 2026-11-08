@@ -1,0 +1,3 @@
+# 同源部署或使用 Vite 代理时无需设置。
+# 前后端分开部署时，填前端的精确 Origin（协议、主机和可选端口，无路径或末尾斜杠）。
+# ALLOWED_ORIGIN=http://localhost:5173

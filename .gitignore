@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.wrangler/
+.aicode/
+.env*
+!.env.example
+.dev.vars*
+!.dev.vars.example
+/wrangler.local.jsonc
+/*.png
+*.log
+logs/
+*.tsbuildinfo
+.DS_Store
