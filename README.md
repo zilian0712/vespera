@@ -2,6 +2,25 @@
 
 一个面向两个人的网页放映室。创建房间、分享邀请链接，让两端在各自设备上加载同一片源，一起看，也一起聊。
 
+## 一键部署到 Cloudflare
+
+**请先 Fork，再部署。** 点击右上角 **Fork**，进入自己账号下的仓库后，再点击下面的部署按钮。
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](../../actions/workflows/deploy.yml)
+
+1. Fork 本仓库，并进入自己的 Fork。上面的按钮使用相对链接，会打开当前仓库的部署工作流；原仓库不提供访客部署，在原仓库运行也会提示「请先 Fork」。
+2. 在自己的 Fork 中打开 **Settings → Secrets and variables → Actions → New repository secret**，添加：
+
+   | Secret | 内容 |
+   | --- | --- |
+   | `CLOUDFLARE_ACCOUNT_ID` | 你的 Cloudflare 账户 ID。 |
+   | `CLOUDFLARE_API_TOKEN` | 你创建的 Cloudflare API 令牌；可使用「Edit Cloudflare Workers」模板，仅授权需要部署的账户。不要填写 Global API Key。 |
+
+3. 打开 **Actions**，首次使用 Fork 时点击启用工作流，然后点击上面的 **Deploy to Cloudflare** 按钮，选择 **Run workflow → Run workflow**。
+4. 工作流会检查 Fork 和凭据，安装依赖、运行测试、构建并部署 Worker、静态资源与 Durable Object。成功后在 **Deploy Worker and assets** 日志中查看站点的 `workers.dev` 地址；自定义域名可稍后在 Cloudflare 配置。
+
+首次部署需完成 Cloudflare 账户的 Workers 设置并启用 `workers.dev` 子域名。更新时先在 Fork 中 **Sync fork**，再运行同一部署工作流。凭据只保存在自己仓库的 Actions Secrets 中，不要提交到代码或填写在 Issue 中。
+
 ## 功能
 
 - 双人房间与邀请链接，支持 MP4 直链和 HLS（M3U8）的播放、暂停、跳转与倍速同步，可选择「缓冲时等对方」。
