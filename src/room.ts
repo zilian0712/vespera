@@ -1,11 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ServerClock, TELEMETRY_TTL } from './sync';
 
+export type AnimeMediaMeta = {
+  bangumiId: number;
+  bangumiTitle: string;
+  episode: number;
+  episodeTitle?: string;
+  episodesTotal?: number;
+  lineCaption?: string;
+  biliCid?: string;
+  biliHmtCid?: string;
+  qqVid?: string;
+};
+
 export type Media = {
   url: string;
   kind: 'video' | 'web';
   title: string;
   id?: string;
+  anime?: AnimeMediaMeta;
 };
 
 export type Playback = {
@@ -18,7 +31,14 @@ export type Playback = {
 };
 
 export type Member = { clientId: string; name: string; ready: boolean; buffering: boolean };
-export type Message = { id: string; text: string; name: string; createdAt: number; videoTime: number };
+export type Message = {
+  id: string;
+  text: string;
+  name: string;
+  createdAt: number;
+  videoTime: number;
+  clientId?: string;
+};
 export type Room = {
   media: Media | null;
   playback: Playback;
@@ -41,6 +61,8 @@ export type PeerTelemetry = {
 
 export const apiBase = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, '') || location.origin;
 
+const TERMINAL_HTTP_STATUSES = new Set([400, 403, 404, 409, 410]);
+
 export async function createRoom(): Promise<{ roomId: string; token: string }> {
   const response = await fetch(`${apiBase}/api/rooms`, { method: 'POST' });
   let data: unknown;
@@ -61,6 +83,19 @@ export async function createRoom(): Promise<{ roomId: string; token: string }> {
   return { roomId: data.roomId, token: data.token };
 }
 
+function loadOrCreateClientId(): string {
+  try {
+    let id = sessionStorage.getItem('zhima-client');
+    if (!id) {
+      id = crypto.randomUUID();
+      sessionStorage.setItem('zhima-client', id);
+    }
+    return id;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
 export function useRoom(roomId: string, token: string, name: string) {
   const [room, setRoom] = useState<Room | null>(null);
   const [connection, setConnection] = useState('未连接');
@@ -68,20 +103,17 @@ export function useRoom(roomId: string, token: string, name: string) {
   const [latency, setLatency] = useState<number | null>(null);
   const [clockReady, setClockReady] = useState(false);
   const [peerTelemetry, setPeerTelemetry] = useState<PeerTelemetry | null>(null);
-  const offset = useRef(0);
   const socket = useRef<WebSocket | null>(null);
+  const nameRef = useRef(name);
+  nameRef.current = name;
+  const lastProfileName = useRef('');
   const clock = useRef<ServerClock | null>(null);
   if (!clock.current) clock.current = new ServerClock();
-  const [clientId] = useState(() => {
-    let id = sessionStorage.getItem('zhima-client');
-    if (!id) {
-      id = crypto.randomUUID();
-      sessionStorage.setItem('zhima-client', id);
-    }
-    return id;
-  });
+  const [clientId] = useState(loadOrCreateClientId);
+  const hasName = Boolean(name);
 
   const serverNow = useCallback(() => clock.current!.now(), []);
+  const clearError = useCallback(() => setError(''), []);
   const send = useCallback((data: object) => {
     if (socket.current?.readyState !== WebSocket.OPEN) return false;
     socket.current.send(JSON.stringify(data));
@@ -89,11 +121,22 @@ export function useRoom(roomId: string, token: string, name: string) {
   }, []);
 
   useEffect(() => {
+    if (!name) {
+      lastProfileName.current = '';
+      return;
+    }
+    if (lastProfileName.current && lastProfileName.current !== name) {
+      send({ type: 'profile', name });
+    }
+    lastProfileName.current = name;
+  }, [name, send]);
+
+  useEffect(() => {
     setRoom(null);
     setPeerTelemetry(null);
     setLatency(null);
     setClockReady(false);
-    if (!roomId || !token || !name) {
+    if (!roomId || !token || !hasName) {
       setConnection('未连接');
       return;
     }
@@ -106,7 +149,6 @@ export function useRoom(roomId: string, token: string, name: string) {
     let expiry: ReturnType<typeof setTimeout> | undefined;
     let heartbeat: ReturnType<typeof setTimeout> | undefined;
     let pingTimer: ReturnType<typeof setInterval> | undefined;
-    let syncTimer: ReturnType<typeof setInterval> | undefined;
     let initialPings: ReturnType<typeof setTimeout>[] = [];
     let resample: (() => void) | undefined;
     let lastResume = -Infinity;
@@ -120,7 +162,6 @@ export function useRoom(roomId: string, token: string, name: string) {
 
     const clearTimers = () => {
       clearInterval(pingTimer);
-      clearInterval(syncTimer);
       clearTimeout(heartbeat);
       for (const timer of initialPings) clearTimeout(timer);
       initialPings = [];
@@ -139,14 +180,44 @@ export function useRoom(roomId: string, token: string, name: string) {
       setRoom(next);
     };
 
+    const probeTerminalFailure = () => {
+      if (typeof fetch !== 'function') return;
+      const checkUrl = new URL(`/api/rooms/${encodeURIComponent(roomId)}`, apiBase);
+      checkUrl.search = new URLSearchParams({ token, clientId, name: nameRef.current }).toString();
+      void Promise.resolve()
+        .then(() => fetch(checkUrl, { method: 'GET' }))
+        .then(async response => {
+          if (stopped || !TERMINAL_HTTP_STATUSES.has(response.status)) return;
+          let reason = '';
+          try {
+            const payload = await response.json() as { error?: { message?: string } };
+            if (typeof payload?.error?.message === 'string') reason = payload.error.message;
+          } catch {
+            // Keep default message if body is empty.
+          }
+          if (stopped) return;
+          stopped = true;
+          clearTimeout(reconnect);
+          const activeSocket = socket.current;
+          socket.current = null;
+          activeSocket?.close();
+          setConnection('连接已关闭');
+          setError(reason || '无法加入该房间，请检查邀请链接');
+        })
+        .catch(() => {
+          // Network or transient upstream failure: let normal backoff reconnect proceed.
+        });
+    };
+
     const connect = () => {
       if (stopped) return;
       setConnection('连接中');
       const url = new URL(`/api/rooms/${encodeURIComponent(roomId)}/ws`, apiBase);
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-      url.search = new URLSearchParams({ token, clientId, name }).toString();
+      url.search = new URLSearchParams({ token, clientId, name: nameRef.current }).toString();
       const ws = new WebSocket(url);
       socket.current = ws;
+      let wasOpen = false;
       const active = () => !stopped && socket.current === ws;
 
       const ping = () => {
@@ -172,19 +243,18 @@ export function useRoom(roomId: string, token: string, name: string) {
         ping();
         initialPings = [250, 500, 750, 1000].map(wait => setTimeout(ping, wait));
         pingTimer = setInterval(ping, 15000);
-        syncTimer = setInterval(() => {
-          if (!active()) return;
-          offset.current = serverNow() - Date.now();
-          send({ type: 'sync' });
-        }, 1500);
       };
       resample = sampleClock;
 
       ws.onopen = () => {
         if (!active()) return;
+        wasOpen = true;
         delay = 800;
         setConnection('已连接');
         setError('');
+        if (lastProfileName.current && lastProfileName.current !== url.searchParams.get('name')) {
+          ws.send(JSON.stringify({ type: 'profile', name: lastProfileName.current }));
+        }
         sampleClock();
       };
 
@@ -206,7 +276,6 @@ export function useRoom(roomId: string, token: string, name: string) {
             clearTimeout(heartbeat);
             setLatency(clock.current!.latency);
             setClockReady(clock.current!.ready);
-            offset.current = serverNow() - Date.now();
           }
         }
         if (data.type === 'snapshot') {
@@ -265,6 +334,7 @@ export function useRoom(roomId: string, token: string, name: string) {
           setError(event.reason || '房间连接已关闭');
           return;
         }
+        if (!wasOpen) probeTerminalFailure();
         setConnection('重新连接');
         reconnect = setTimeout(connect, delay);
         delay = Math.min(delay * 2, 10000);
@@ -294,7 +364,7 @@ export function useRoom(roomId: string, token: string, name: string) {
       socket.current = null;
       ws?.close();
     };
-  }, [roomId, token, name, clientId, send, serverNow]);
+  }, [roomId, token, hasName, clientId, send, serverNow]);
 
-  return { room, connection, error, latency, offset, clientId, send, serverNow, clockReady, peerTelemetry };
+  return { room, connection, error, clearError, latency, clientId, send, serverNow, clockReady, peerTelemetry };
 }

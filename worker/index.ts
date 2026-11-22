@@ -1,11 +1,12 @@
 import { DurableObject } from 'cloudflare:workers';
+import { handleAnimeRequest, type AnimeEnv } from './anime';
 import {
   ROOM_TTL, InputError, appendChat, applyControl, boundedText, consumeRateLimit,
   currentPlayback, isAllowedOrigin, parseMessage, reconcilePlayback,
   type Member, type RoomState,
 } from './state';
 
-export interface Env {
+export interface Env extends AnimeEnv {
   ROOMS: DurableObjectNamespace<Room>;
   ASSETS: Fetcher;
   ALLOWED_ORIGIN?: string;
@@ -13,7 +14,38 @@ export interface Env {
 
 interface Attachment extends Member {
   active: boolean;
+  selfOrigin?: string;
   limit: { start: number; count: number };
+}
+
+const SECURITY_HEADERS: Record<string, string> = {
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'camera=(), geolocation=(), microphone=(self)',
+  'Content-Security-Policy': "frame-ancestors 'self'",
+};
+
+const CREATE_WINDOW_MS = 60_000;
+const CREATE_LIMIT_PER_IP = 20;
+const createRoomBuckets = new Map<string, { start: number; count: number }>();
+
+export function resetCreateRoomLimits(): void {
+  createRoomBuckets.clear();
+}
+
+function consumeCreateRoomLimit(ip: string, now: number): boolean {
+  if (createRoomBuckets.size > 1000) {
+    for (const [key, entry] of createRoomBuckets) {
+      if (now - entry.start >= CREATE_WINDOW_MS) createRoomBuckets.delete(key);
+    }
+  }
+  const existing = createRoomBuckets.get(ip);
+  if (!existing || now - existing.start >= CREATE_WINDOW_MS) {
+    createRoomBuckets.set(ip, { start: now, count: 1 });
+    return true;
+  }
+  existing.count += 1;
+  return existing.count <= CREATE_LIMIT_PER_IP;
 }
 
 function json(value: unknown, status = 200): Response {
@@ -26,6 +58,27 @@ function failure(code: string, message: string, status: number): Response {
 
 function randomToken(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function safeClose(socket: WebSocket, code: number, reason: string): void {
+  try {
+    socket.close(code, reason);
+  } catch {
+    // Socket may already be closing or closed at the transport layer.
+  }
+}
+
+function withSecurityHeaders(response: Response): Response {
+  if (response.status === 101) return response;
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
+    if (!headers.has(key)) headers.set(key, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 export class Room extends DurableObject<Env> {
@@ -46,7 +99,11 @@ export class Room extends DurableObject<Env> {
   }
 
   private sockets(): WebSocket[] {
-    return this.ctx.getWebSockets().filter(socket => socket.readyState === 1 && (socket.deserializeAttachment() as Attachment).active);
+    return this.ctx.getWebSockets().filter(socket => {
+      if (socket.readyState !== 1) return false;
+      const attachment = socket.deserializeAttachment() as Attachment | null;
+      return !!attachment?.active;
+    });
   }
 
   private members(): Member[] {
@@ -65,7 +122,7 @@ export class Room extends DurableObject<Env> {
       socket.send(JSON.stringify(value));
     } catch {
       // A closing peer can remain visible until its close callback is delivered.
-      try { socket.close(1011, '连接已关闭，请重新连接'); } catch { /* Already closed. */ }
+      safeClose(socket, 1011, '连接已关闭，请重新连接');
     }
   }
 
@@ -99,9 +156,28 @@ export class Room extends DurableObject<Env> {
   }
 
   private async expire(): Promise<void> {
-    for (const socket of this.sockets()) socket.close(4001, '房间已过期');
+    for (const socket of this.sockets()) safeClose(socket, 4001, '房间已过期');
     await this.ctx.storage.deleteAll();
     this.state = undefined;
+  }
+
+  private validateJoinParams(url: URL): { ok: false; response: Response } | { ok: true; clientId: string; name: string } {
+    const token = url.searchParams.get('token');
+    if (!token || token !== this.state!.token) {
+      return { ok: false, response: failure('INVALID_TOKEN', '邀请链接无效', 403) };
+    }
+    const clientId = url.searchParams.get('clientId') ?? '';
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(clientId)) {
+      return { ok: false, response: failure('INVALID_CLIENT_ID', 'clientId 必须为 1–64 位字母、数字、下划线或连字符', 400) };
+    }
+    let name: string;
+    try { name = boundedText(url.searchParams.get('name'), '昵称', 40); }
+    catch (error) { return { ok: false, response: failure('INVALID_NAME', (error as Error).message, 400) }; }
+    const distinct = new Set(this.members().map(member => member.clientId));
+    if (!distinct.has(clientId) && distinct.size >= 2) {
+      return { ok: false, response: failure('ROOM_FULL', '房间最多容纳两位成员', 409) };
+    }
+    return { ok: true, clientId, name };
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -127,30 +203,33 @@ export class Room extends DurableObject<Env> {
         await this.expire();
         return failure('ROOM_EXPIRED', '房间已过期，请创建新房间', 410);
       }
+      if (url.pathname === '/internal/status' && request.method === 'GET') {
+        const checked = this.validateJoinParams(url);
+        if (!checked.ok) return checked.response;
+        return json({ ok: true, roomId: this.state.roomId, expiresAt: this.state.expiresAt, members: this.members().length });
+      }
       if (request.method !== 'GET' || request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
         return failure('WEBSOCKET_REQUIRED', '请使用 WebSocket 连接', 426);
       }
       if (!isAllowedOrigin(request.headers.get('Origin'), request.url, this.env.ALLOWED_ORIGIN)) {
         return failure('ORIGIN_DENIED', '该来源不允许连接房间', 403);
       }
-      const token = url.searchParams.get('token');
-      if (!token || token !== this.state.token) return failure('INVALID_TOKEN', '邀请链接无效', 403);
-      const clientId = url.searchParams.get('clientId') ?? '';
-      if (!/^[A-Za-z0-9_-]{1,64}$/.test(clientId)) return failure('INVALID_CLIENT_ID', 'clientId 必须为 1–64 位字母、数字、下划线或连字符', 400);
-      let name: string;
-      try { name = boundedText(url.searchParams.get('name'), '昵称', 40); }
-      catch (error) { return failure('INVALID_NAME', (error as Error).message, 400); }
+      const checked = this.validateJoinParams(url);
+      if (!checked.ok) return checked.response;
+      const { clientId, name } = checked;
       const existing = this.sockets().filter(socket => (socket.deserializeAttachment() as Attachment).clientId === clientId);
-      const distinct = new Set(this.members().map(member => member.clientId));
-      if (!distinct.has(clientId) && distinct.size >= 2) return failure('ROOM_FULL', '房间最多容纳两位成员', 409);
       for (const socket of existing) {
         socket.serializeAttachment({ ...socket.deserializeAttachment() as Attachment, active: false });
-        socket.close(4000, '同一客户端已在其他连接重连');
+        safeClose(socket, 4000, '同一客户端已在其他连接重连');
       }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.ctx.acceptWebSocket(server);
-      server.serializeAttachment({ clientId, name, ready: false, buffering: false, active: true, limit: { start: Date.now(), count: 0 } } satisfies Attachment);
+      server.serializeAttachment({
+        clientId, name, ready: false, buffering: false, active: true,
+        selfOrigin: url.origin,
+        limit: { start: Date.now(), count: 0 },
+      } satisfies Attachment);
       if (reconcilePlayback(this.state, this.members(), Date.now())) await this.save();
       this.snapshot(server);
       this.broadcast({ type: 'state', ...this.statePayload(Date.now()) });
@@ -162,22 +241,24 @@ export class Room extends DurableObject<Env> {
     await this.serial(async () => {
       if (!this.state || Date.now() >= this.state.expiresAt) {
         if (this.state) await this.expire();
-        else socket.close(4001, '房间已过期');
+        else safeClose(socket, 4001, '房间已过期');
         return;
       }
-      if (!this.active(socket)) { socket.close(4000, '连接已被替换'); return; }
+      if (!this.active(socket)) { safeClose(socket, 4000, '连接已被替换'); return; }
       const identity = socket.deserializeAttachment() as Attachment;
       const now = Date.now();
       if (!consumeRateLimit(identity.limit, now)) {
-        socket.serializeAttachment(identity);
         this.send(socket, { type: 'error', code: 'RATE_LIMITED', message: '消息过于频繁，请稍后再试', serverTime: now });
-        socket.close(1008, '消息过于频繁');
+        safeClose(socket, 1008, '消息过于频繁');
         return;
       }
       socket.serializeAttachment(identity);
       try {
-        if (typeof data !== 'string' || new TextEncoder().encode(data).byteLength > 32768) throw new InputError('请发送不超过 32 KiB 的 JSON 文本消息');
-        const message = parseMessage(data);
+        if (typeof data !== 'string' || new TextEncoder().encode(data).byteLength > 32768) {
+          throw new InputError('请发送不超过 32 KiB 的 JSON 文本消息');
+        }
+        const blockedWebOrigins = [identity.selfOrigin, this.env.ALLOWED_ORIGIN].filter((item): item is string => !!item);
+        const message = parseMessage(data, { blockedWebOrigins });
         switch (message.type) {
           case 'sync': this.snapshot(socket); return;
           case 'ping': this.send(socket, { type: 'pong', clientTime: message.clientTime, serverTime: now }); return;
@@ -186,9 +267,15 @@ export class Room extends DurableObject<Env> {
             this.broadcast({ ...message, clientId: identity.clientId, receivedAt: now });
             return;
           case 'media':
-            this.state.media = { url: message.url, kind: message.kind, title: message.title, id: crypto.randomUUID() };
+            this.state.media = {
+              url: message.url, kind: message.kind, title: message.title, id: crypto.randomUUID(),
+              ...(message.anime ? { anime: message.anime } : {}),
+            };
             this.state.userPaused = true;
-            this.state.playback = { paused: true, position: 0, rate: 1, updatedAt: now, revision: this.state.playback.revision + 1, seekRevision: 0 };
+            this.state.playback = {
+              paused: true, position: 0, rate: 1, updatedAt: now,
+              revision: this.state.playback.revision + 1, seekRevision: 0,
+            };
             for (const peer of this.sockets()) {
               const attachment = peer.deserializeAttachment() as Attachment;
               peer.serializeAttachment({ ...attachment, ready: false, buffering: false });
@@ -202,13 +289,24 @@ export class Room extends DurableObject<Env> {
               return;
             }
             break;
+          case 'profile':
+            socket.serializeAttachment({ ...identity, name: message.name });
+            for (let i = this.state.chat.length - 1; i >= 0; i--) {
+              if (this.state.chat[i].clientId === identity.clientId) {
+                this.state.chat[i] = { ...this.state.chat[i], name: message.name };
+              }
+            }
+            await this.save();
+            this.broadcast({ type: 'state', ...this.statePayload(now), chat: this.state.chat });
+            return;
           case 'settings':
             this.state.waitTogether = message.waitTogether;
             if (!reconcilePlayback(this.state, this.members(), now)) this.state.playback.revision += 1;
             break;
           case 'chat': {
             const chat = {
-              id: crypto.randomUUID(), text: message.text, name: identity.name, createdAt: now,
+              id: crypto.randomUUID(), text: message.text, name: identity.name,
+              clientId: identity.clientId, createdAt: now,
               videoTime: currentPlayback(this.state.playback, now).position,
             };
             this.state.chat = appendChat(this.state.chat, chat);
@@ -225,17 +323,18 @@ export class Room extends DurableObject<Env> {
         } else {
           console.error('Room message could not be persisted');
           this.send(socket, { type: 'error', code: 'INTERNAL_ERROR', message: '状态保存失败，请重新连接', serverTime: now });
-          socket.close(1011, '状态保存失败');
+          safeClose(socket, 1011, '状态保存失败');
           throw error;
         }
       }
     });
   }
 
-  async webSocketClose(socket: WebSocket): Promise<void> {
+  private async handleSocketTermination(socket: WebSocket, closeNormal: boolean): Promise<void> {
     await this.serial(async () => {
-      socket.serializeAttachment({ ...socket.deserializeAttachment() as Attachment, active: false });
-      socket.close(1000, '连接已关闭');
+      const existing = socket.deserializeAttachment() as Attachment | null;
+      if (existing) socket.serializeAttachment({ ...existing, active: false });
+      if (closeNormal) safeClose(socket, 1000, '连接已关闭');
       if (!this.state) return;
       const now = Date.now();
       if (now >= this.state.expiresAt) { await this.expire(); return; }
@@ -244,9 +343,13 @@ export class Room extends DurableObject<Env> {
     });
   }
 
+  async webSocketClose(socket: WebSocket): Promise<void> {
+    await this.handleSocketTermination(socket, true);
+  }
+
   async webSocketError(socket: WebSocket): Promise<void> {
-    socket.close(1011, '连接异常，请重新连接');
-    await this.webSocketClose(socket);
+    safeClose(socket, 1011, '连接异常，请重新连接');
+    await this.handleSocketTermination(socket, false);
   }
 
   async alarm(): Promise<void> {
@@ -264,10 +367,14 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const api = url.pathname === '/api' || url.pathname.startsWith('/api/');
-    if (!api) return env.ASSETS.fetch(request);
+    if (!api) {
+      const assetResponse = await env.ASSETS.fetch(request);
+      return withSecurityHeaders(assetResponse);
+    }
+
     const origin = request.headers.get('Origin');
     const allowed = isAllowedOrigin(origin, request.url, env.ALLOWED_ORIGIN);
-    const cors = new Headers({ 'Cache-Control': 'no-store', 'Vary': 'Origin' });
+    const cors = new Headers({ 'Vary': 'Origin' });
     if (allowed && origin) {
       cors.set('Access-Control-Allow-Origin', origin);
       cors.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -276,13 +383,25 @@ export default {
     const respond = (response: Response): Response => {
       if (response.status === 101) return response;
       const headers = new Headers(response.headers);
+      if (!headers.has('Cache-Control')) headers.set('Cache-Control', 'no-store');
       cors.forEach((value, key) => headers.set(key, value));
-      return new Response(response.body, { status: response.status, headers });
+      return withSecurityHeaders(new Response(response.body, { status: response.status, headers }));
     };
+
     if (origin && !allowed) return respond(failure('ORIGIN_DENIED', '该来源不允许访问 API', 403));
     if (request.method === 'OPTIONS') return respond(new Response(null, { status: 204 }));
+
     try {
+      if (url.pathname === '/api/anime' || url.pathname.startsWith('/api/anime/')) {
+        return respond(await handleAnimeRequest(request, env));
+      }
+
       if (url.pathname === '/api/rooms' && request.method === 'POST') {
+        if (!allowed) return respond(failure('ORIGIN_DENIED', '创建房间需要有效的 Origin 请求头', 403));
+        const ip = request.headers.get('CF-Connecting-IP') || 'local';
+        if (!consumeCreateRoomLimit(ip, Date.now())) {
+          return respond(failure('RATE_LIMITED', '创建房间过于频繁，请稍后再试', 429));
+        }
         const roomId = crypto.randomUUID().replaceAll('-', '');
         const token = randomToken();
         const room = env.ROOMS.get(env.ROOMS.idFromName(roomId));
@@ -290,12 +409,28 @@ export default {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roomId, token }),
         })));
       }
-      const match = /^\/api\/rooms\/([a-f0-9]{32})\/ws$/.exec(url.pathname);
-      if (match && request.method === 'GET') {
+
+      const statusMatch = /^\/api\/rooms\/([^/]+)$/.exec(url.pathname);
+      if (statusMatch && request.method === 'GET') {
+        if (!/^[a-f0-9]{32}$/.test(statusMatch[1])) {
+          return respond(failure('ROOM_NOT_FOUND', '房间不存在或已经过期', 404));
+        }
+        const room = env.ROOMS.get(env.ROOMS.idFromName(statusMatch[1]));
+        const checkUrl = new URL('/internal/status', request.url);
+        checkUrl.search = url.search;
+        return respond(await room.fetch(new Request(checkUrl, { method: 'GET' })));
+      }
+
+      const wsMatch = /^\/api\/rooms\/([^/]+)\/ws$/.exec(url.pathname);
+      if (wsMatch && request.method === 'GET') {
         if (!allowed) return respond(failure('ORIGIN_DENIED', 'WebSocket 连接需要有效的 Origin', 403));
-        const room = env.ROOMS.get(env.ROOMS.idFromName(match[1]));
+        if (!/^[a-f0-9]{32}$/.test(wsMatch[1])) {
+          return respond(failure('ROOM_NOT_FOUND', '房间不存在或已经过期', 404));
+        }
+        const room = env.ROOMS.get(env.ROOMS.idFromName(wsMatch[1]));
         return respond(await room.fetch(request));
       }
+
       return respond(failure('NOT_FOUND', 'API 地址或请求方法无效', 404));
     } catch (error) {
       console.error('Room request failed', error instanceof Error ? error.message : 'Unknown error');

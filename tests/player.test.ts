@@ -266,6 +266,10 @@ async function playerHarness(initial: { readyState?: number; playback?: Partial<
         props = { ...props, playback: { ...props.playback!, ...change } };
         render();
       },
+      setProps: (patch: Partial<PlayerProps>) => {
+        props = { ...props, ...patch };
+        render();
+      },
       restore: () => { try { unmount(); } finally { restoreGlobals(); } },
     };
   } catch (error) {
@@ -832,5 +836,80 @@ test('Player forwards a sustained native iOS pause once after the fullscreen exi
     assert.equal(harness.messages.filter(message => message.data.type === 'control').length, 1);
     assert.deepEqual(harness.video.plays, []);
     assert.deepEqual(harness.video.pauses, []);
+  } finally { harness.restore(); }
+});
+
+test('Player waits 1s grace on ended before pausing room, and replays from 0 when Play is pressed at end', async () => {
+  const harness = await playerHarness();
+  try {
+    harness.render();
+    await harness.advance(1000);
+    harness.clearCalls();
+
+    harness.video.ended = true;
+    harness.video.paused = true;
+    harness.emit('onEnded');
+    await harness.advance(500);
+    assert.deepEqual(harness.messages.filter(m => m.data.type === 'control'), [], '500ms within grace period must not cut off trailing peer');
+
+    await harness.advance(600);
+    assert.deepEqual(
+      harness.messages.filter(m => m.data.type === 'control').map(m => m.data),
+      [{ type: 'control', action: 'pause' }],
+    );
+
+    harness.setProps({
+      userPaused: true,
+      playback: { paused: true, position: harness.video.duration, rate: 1, revision: 2, updatedAt: harness.epoch + harness.now() },
+    });
+    harness.clearCalls();
+    await harness.click('播放');
+    const controls = harness.messages.filter(m => m.data.type === 'control').map(m => m.data);
+    assert.deepEqual(controls, [
+      { type: 'control', action: 'seek', position: 0 },
+      { type: 'control', action: 'play' },
+    ]);
+    assert.equal(harness.video.currentTime, 0);
+  } finally { harness.restore(); }
+});
+
+test('Player surfaces peer-buffering status badge and emits timeline danmaku without flooding on seek', async () => {
+  const harness = await playerHarness();
+  try {
+    harness.setProps({
+      userPaused: false,
+      playback: { paused: true, position: 10, rate: 1, revision: 2, updatedAt: harness.epoch },
+      timelineDanmaku: [
+        { id: 'd1', time: 10.4, text: '第一条时间轴弹幕', color: '#ffaa33', mode: 'scroll' },
+        { id: 'd2', time: 50.2, text: '跳转前的弹幕', color: '#ffffff', mode: 'scroll' },
+        { id: 'd3', time: 60.5, text: '跳转后的弹幕', color: '#66ccff', mode: 'top' },
+      ],
+    });
+    const statusTags = harness.elements.filter(el => el.props.className === 'buffer-tag');
+    assert.equal(statusTags.some(el => JSON.stringify(el.props.children).includes('正在等待同伴缓冲就绪')), true);
+
+    harness.setProps({
+      userPaused: false,
+      playback: { paused: false, position: 10, rate: 1, revision: 3, updatedAt: harness.epoch + harness.now() },
+    });
+    harness.video.paused = false;
+    harness.setPosition(10.0);
+    harness.emit('onTimeUpdate');
+    harness.setPosition(10.6);
+    harness.emit('onTimeUpdate');
+    harness.render();
+
+    const activeTexts = () => harness.elements
+      .filter(el => typeof el.props.className === 'string' && el.props.className.startsWith('danmaku-item'))
+      .map(el => el.props.children?.props?.text);
+    assert.deepEqual(activeTexts(), ['第一条时间轴弹幕']);
+
+    // Jump from 10.6s -> 60.0s: d2 at 50.2s must NOT flood onto screen, while d3 at 60.5s plays cleanly!
+    harness.setPosition(60.0);
+    harness.emit('onSeeked');
+    harness.setPosition(60.7);
+    harness.emit('onTimeUpdate');
+    harness.render();
+    assert.deepEqual(activeTexts(), ['第一条时间轴弹幕', '跳转后的弹幕']);
   } finally { harness.restore(); }
 });

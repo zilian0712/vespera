@@ -33,9 +33,12 @@ class Stream {
   getAudioTracks() { return [this.track]; }
   asMedia() { return this as unknown as MediaStream; }
 }
-const sdp = (value: string) => ({ type: 'offer', sdp: `v=0\r\na=fingerprint:sha-256 ${value.match(/../g)!.join(':')}\r\n` } as RTCSessionDescription);
-function pc(local = 'a'.repeat(64), remote = 'b'.repeat(64)) {
-  return Object.assign(new EventTarget(), { localDescription: sdp(local), remoteDescription: sdp(remote), connectionState: 'connected', iceConnectionState: 'connected' }) as unknown as RTCPeerConnection;
+const sdp = (value: string, upper = false) => ({
+  type: 'offer',
+  sdp: `v=0\r\na=fingerprint:${upper ? 'SHA-256' : 'sha-256'} ${value.match(/../g)!.join(':').toUpperCase()}\r\n`,
+} as RTCSessionDescription);
+function pc(local = 'a'.repeat(64), remote = 'b'.repeat(64), upper = false) {
+  return Object.assign(new EventTarget(), { localDescription: sdp(local, upper), remoteDescription: sdp(remote, upper), connectionState: 'connected', iceConnectionState: 'connected' }) as unknown as RTCPeerConnection;
 }
 class Data extends Events implements VoiceDataConnection {
   open = true;
@@ -44,7 +47,7 @@ class Data extends Events implements VoiceDataConnection {
   other?: Data;
   closed = false;
   constructor(public peer: string, public connectionId: string, public network: Network, public side: 'a' | 'b') {
-    super(); this.peerConnection = side === 'a' ? pc() : pc('b'.repeat(64), 'a'.repeat(64));
+    super(); this.peerConnection = side === 'a' ? pc('a'.repeat(64), 'b'.repeat(64), network.uppercaseFp) : pc('b'.repeat(64), 'a'.repeat(64), network.uppercaseFp);
   }
   send(value: unknown) {
     if (this.closed) throw new Error('closed');
@@ -65,7 +68,7 @@ class Media extends Events implements VoiceMediaConnection {
   answers: (MediaStream | undefined)[] = [];
   stream?: MediaStream;
   constructor(public peer: string, public connectionId: string, public metadata: unknown, side: 'a' | 'b', public network: Network) {
-    super(); this.peerConnection = side === 'a' ? pc('c'.repeat(64), 'd'.repeat(64)) : pc('d'.repeat(64), 'c'.repeat(64));
+    super(); this.peerConnection = side === 'a' ? pc('c'.repeat(64), 'd'.repeat(64), network.uppercaseFp) : pc('d'.repeat(64), 'c'.repeat(64), network.uppercaseFp);
   }
   answer(stream?: MediaStream) {
     this.answers.push(stream); this.stream = stream;
@@ -125,6 +128,7 @@ class Network {
   remoteStreams: Stream[] = [];
   settings: VoicePeerOptions[] = [];
   next = 0;
+  uppercaseFp = false;
   transform?: (data: unknown, side: 'a' | 'b') => unknown;
   createPeer = (id: string, settings: VoicePeerOptions) => {
     const peer = new Peer(id, this); this.peers.set(id, peer); this.settings.push(settings); return peer;
@@ -153,8 +157,8 @@ async function pair(mode: VoiceMode = 'call', configure?: (network: Network) => 
   const close = () => { a.destroy(); b.destroy(); };
   return { network, a, b, aStreams, bStreams, pending, received, close };
 }
-async function readyPair(mode: VoiceMode = 'call') {
-  const result = await pair(mode);
+async function readyPair(mode: VoiceMode = 'call', configure?: (network: Network) => void) {
+  const result = await pair(mode, configure);
   await until(() => result.a.getSnapshot().authenticated && result.b.getSnapshot().authenticated);
   return result;
 }
@@ -417,5 +421,17 @@ test('simultaneous normal calls resolve deterministically to one session', async
     await until(() => result.a.getSnapshot().phase === 'active' && result.b.getSnapshot().phase === 'active');
     assert.equal(result.network.media.length, 2);
     assert.equal(result.bStreams[0].track.stopped, true);
+  } finally { result.close(); }
+});
+
+test('RFC 4572 uppercase SHA-256 SDP fingerprints authenticate data and media sessions', async () => {
+  const result = await readyPair('call', network => { network.uppercaseFp = true; });
+  try {
+    assert.equal(result.a.getSnapshot().authenticated, true);
+    assert.equal(result.b.getSnapshot().authenticated, true);
+    result.a.call();
+    await until(() => result.b.getSnapshot().phase === 'incoming');
+    result.b.accept();
+    await until(() => result.a.getSnapshot().listening && result.b.getSnapshot().listening);
   } finally { result.close(); }
 });
