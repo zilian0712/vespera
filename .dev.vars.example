@@ -1,3 +1,9 @@
 # 同源部署或使用 Vite 代理时无需设置。
 # 前后端分开部署时，填前端的精确 Origin（协议、主机和可选端口，无路径或末尾斜杠）。
 # ALLOWED_ORIGIN=http://localhost:5173
+
+# 番剧网关可选配置（多个镜像地址用英文逗号分隔，按顺序自动降级）。
+# ANICH_API_BASE=https://ani.emmmm.eu.org,https://api.emmmm.eu.org,https://api.500403.xyz
+# ANICH_USER_AGENT=cx.xs.open Android 1.0.0
+# ANICH_BILI_DANMAKU_BASE=https://bili-dm.emmmm.eu.org
+# ANICH_QQ_DANMAKU_BASE=https://dm.video.qq.com

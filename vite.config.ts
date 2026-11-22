@@ -7,9 +7,16 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     server: {
+      allowedHosts: true,
       proxy: {
         '/api': { target, ws: true, changeOrigin: true, headers: { Origin: target } },
       },
+    },
+    preview: {
+      allowedHosts: true,
+    },
+    build: {
+      chunkSizeWarningLimit: 650,
     },
   };
 });

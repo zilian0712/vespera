@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
-import Hls from 'hls.js';
+import type Hls from 'hls.js';
 import { ArrowLeft, Check, ChevronDown, Maximize, MessageSquare, Minimize, Pause, Play, RotateCcw, RotateCw, Send, Volume2, VolumeX, X } from 'lucide-react';
 import type { Media, Message, PeerTelemetry, Playback } from './room';
 import { chooseCorrection, projectPosition } from './sync';
 import { useViewport } from './viewport';
-import { danmakuColors, danmakuStorageKey, defaultDanmaku, loadDanmaku, type DanmakuPreferences } from './danmaku';
+import {
+  danmakuColors, danmakuStorageKey, defaultDanmaku,
+  loadAnimeDanmakuEnabled, loadDanmaku, saveAnimeDanmakuEnabled,
+  type DanmakuPreferences,
+} from './danmaku';
 import { findReaction, reactions, reactionText } from './reactions';
 import ReactionContent from './ReactionContent';
 import { isPictureInPicture, supportsPictureInPicture, togglePictureInPicture } from './pip';
@@ -14,9 +18,26 @@ export function formatTime(value: number, precise = false) {
   const milliseconds = Math.max(0, Math.round((Number.isFinite(value) ? value : 0) * 1000));
   const seconds = Math.floor(milliseconds / 1000);
   const hours = Math.floor(seconds / 3600);
-  const time = `${hours ? `${hours}:` : ''}${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+  const time = `${hours ? `${hours}:` : ''}${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(seconds % 60).padStart(3 === 3 ? 2 : 2, '0')}`;
   return precise ? `${time}.${String(milliseconds % 1000).padStart(3, '0')}` : time;
 }
+
+export type PlayerTimelineDanmaku = {
+  id: string;
+  time: number;
+  text: string;
+  color?: string;
+  mode?: 'scroll' | 'top' | 'bottom';
+};
+
+type BurstItem = {
+  id: string;
+  text: string;
+  lane: number;
+  shownAt: number;
+  customColor?: string;
+  pinned?: 'top' | 'bottom';
+};
 
 type FullscreenDocument = Document & {
   webkitFullscreenElement?: Element | null;
@@ -31,6 +52,15 @@ type FullscreenVideo = HTMLVideoElement & {
   webkitDisplayingFullscreen?: boolean;
 };
 
+function isSameOriginWebUrl(rawUrl: string): boolean {
+  if (typeof location === 'undefined' || !location.origin) return false;
+  try {
+    return new URL(rawUrl).origin === location.origin;
+  } catch {
+    return false;
+  }
+}
+
 type Props = {
   media: Media | null;
   playback?: Playback;
@@ -40,13 +70,17 @@ type Props = {
   peerTelemetry: PeerTelemetry | null;
   send: (data: object) => boolean;
   messages: Message[];
+  timelineDanmaku?: PlayerTimelineDanmaku[];
   connected: boolean;
   onTyping: (typing: boolean) => void;
   onSource: () => void;
   voiceControls?: ReactNode;
 };
 
-export default function Player({ media, playback, userPaused, serverNow, clockReady, peerTelemetry, send, messages, connected, onTyping, onSource, voiceControls }: Props) {
+export default function Player({
+  media, playback, userPaused, serverNow, clockReady, peerTelemetry,
+  send, messages, timelineDanmaku, connected, onTyping, onSource, voiceControls,
+}: Props) {
   const video = useRef<HTMLVideoElement>(null);
   const root = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
@@ -57,6 +91,7 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
   const fullscreenPending = useRef(false);
   const nativeVideoActive = useRef(false);
   const nativePauseTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const endedPauseTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scriptedSeek = useRef<number | null>(null);
   const seekVideo = useCallback((element: HTMLVideoElement, position: number) => {
     scriptedSeek.current = position; element.currentTime = position;
@@ -82,6 +117,7 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
   const [composerOpen, setComposerOpen] = useState(false);
   const [text, setText] = useState('');
   const [danmaku, setDanmaku] = useState(true);
+  const [animeDanmaku, setAnimeDanmaku] = useState(loadAnimeDanmakuEnabled);
   const [preferences, setPreferences] = useState(loadDanmaku);
   const [danmakuSettings, setDanmakuSettings] = useState(false);
   const [reactionsOpen, setReactionsOpen] = useState(false);
@@ -92,9 +128,13 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
   const [feedback, setFeedback] = useState('');
   const [drift, setDrift] = useState<number | null>(null);
   const [peerDrift, setPeerDrift] = useState<number | null>(null);
-  const [bursts, setBursts] = useState<(Message & { lane: number; shownAt: number })[]>([]);
-  const latest = useRef({ playback, userPaused, connected, clockReady, peerTelemetry });
-  latest.current = { playback, userPaused, connected, clockReady, peerTelemetry };
+  const [bursts, setBursts] = useState<BurstItem[]>([]);
+  const latest = useRef({ playback, userPaused, connected, clockReady, peerTelemetry, volume, muted });
+  latest.current = { playback, userPaused, connected, clockReady, peerTelemetry, volume, muted };
+  const timelineRef = useRef(timelineDanmaku);
+  timelineRef.current = timelineDanmaku;
+  const timelineCursor = useRef<number | null>(null);
+  const emittedTimelineIds = useRef(new Set<string>());
   const dragging = useRef(false);
   const previewRef = useRef<number | null>(null);
   const appliedSeekRevision = useRef<number | null>(null);
@@ -191,7 +231,12 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
     const timer = setTimeout(() => setFeedback(''), 2600);
     return () => clearTimeout(timer);
   }, [feedback]);
-  useEffect(() => () => { clearTimeout(tap.current); clearTimeout(waitingTimer.current); clearTimeout(nativePauseTimer.current); }, []);
+  useEffect(() => () => {
+    clearTimeout(tap.current);
+    clearTimeout(waitingTimer.current);
+    clearTimeout(nativePauseTimer.current);
+    clearTimeout(endedPauseTimer.current);
+  }, []);
 
   const reportStatus = useCallback((force = false) => {
     const v = video.current;
@@ -214,6 +259,9 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
 
   useEffect(() => {
     setError(''); setSettings(false); setDanmakuSettings(false); setReactionsOpen(false);
+    timelineCursor.current = null;
+    emittedTimelineIds.current.clear();
+    clearTimeout(endedPauseTimer.current);
     const v = video.current;
     if (!v || !media || media.kind !== 'video') return;
     let disposed = false;
@@ -226,30 +274,45 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
     lastSeekAt.current = -Infinity; lastRateAt.current = -Infinity;
     statusRef.current = ''; dragging.current = false;
     gestureBlocked.current = false; fatalError.current = false;
-    if (media.url.includes('.m3u8')) {
-      if (v.canPlayType('application/vnd.apple.mpegurl')) v.src = media.url;
-      else if (Hls.isSupported()) {
-        hls = new Hls({ maxBufferLength: 30, backBufferLength: 30 });
-        hls.attachMedia(v);
-        hls.loadSource(media.url);
-        hls.on(Hls.Events.ERROR, (_event, data) => {
-          if (disposed || !data.fatal) return;
-          setBuffering(false); fatalError.current = true;
-          send({ type: 'status', ready: false, buffering: true });
-          setError(data.response?.code === 403 ? '片源拒绝访问，链接可能已经过期。请更换链接。' : '片源加载失败，请检查跨域权限、链接时效或网络。');
+    if ('volume' in v) v.volume = latest.current.volume;
+    if ('muted' in v) v.muted = latest.current.muted;
+    if (/\.m3u8(?:$|[?#])/i.test(media.url)) {
+      if (v.canPlayType('application/vnd.apple.mpegurl')) {
+        v.src = media.url;
+        v.load();
+      } else {
+        void import('hls.js').then(({ default: HlsLib }) => {
+          if (disposed) return;
+          if (HlsLib.isSupported()) {
+            hls = new HlsLib({ maxBufferLength: 30, backBufferLength: 30 });
+            hls.attachMedia(v);
+            hls.loadSource(media.url);
+            hls.on(HlsLib.Events.ERROR, (_event, data) => {
+              if (disposed || !data.fatal) return;
+              setBuffering(false); fatalError.current = true;
+              send({ type: 'status', ready: false, buffering: true });
+              setError(data.response?.code === 403 ? '片源拒绝访问，链接可能已经过期。请更换链接。' : '片源加载失败，请检查跨域权限、链接时效或网络。');
+            });
+          } else {
+            setError('当前浏览器无法播放 HLS，请使用新版 Chrome 或 Safari。');
+          }
+        }).catch(() => {
+          if (!disposed) setError('HLS 播放组件加载失败，请刷新页面后重试。');
         });
-      } else setError('当前浏览器无法播放 HLS，请使用新版 Chrome 或 Safari。');
-    } else v.src = media.url;
-    if (!hls) v.load();
+      }
+    } else {
+      v.src = media.url;
+      v.load();
+    }
     return () => {
       disposed = true; hls?.destroy(); pauseVideo(v); v.removeAttribute('src'); v.load();
     };
-  }, [media?.url, media?.kind, media?.id, retry]);
+  }, [media?.url, media?.kind, media?.id, retry, pauseVideo, send]);
 
   useEffect(() => {
     if (!connected || media?.kind !== 'video') return;
     reportStatus(true);
-    const timer = setInterval(() => reportStatus(true), 3000);
+    const timer = setInterval(() => reportStatus(false), 3000);
     return () => clearInterval(timer);
   }, [connected, media?.id, media?.url, reportStatus]);
 
@@ -346,15 +409,70 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
     if (seen.current.size > 200) seen.current = new Set(messages.map(message => message.id));
     if (danmaku) {
       const recent = incoming.filter(message => Math.abs(serverNow() - message.createdAt) < 8000);
-      if (recent.length) setBursts(previous => [...previous, ...recent.map(message => ({ ...message, lane: lane.current++ % 4, shownAt: performance.now() }))].slice(-12));
+      if (recent.length) {
+        setBursts(previous => [
+          ...previous,
+          ...recent.map(message => ({
+            id: message.id,
+            text: message.text,
+            lane: lane.current++ % 4,
+            shownAt: performance.now(),
+          })),
+        ].slice(-18));
+      }
     }
   }, [messages, danmaku, serverNow]);
+
   useEffect(() => {
     if (!bursts.length) return;
     const remaining = Math.min(...bursts.map(message => message.shownAt + preferences.duration * 1000 - performance.now()));
     const timer = setTimeout(() => setBursts(previous => previous.filter(message => performance.now() - message.shownAt < preferences.duration * 1000)), Math.max(1, remaining));
     return () => clearTimeout(timer);
   }, [bursts, preferences.duration]);
+
+  const advanceTimelineDanmaku = useCallback((videoTime: number) => {
+    const items = timelineRef.current;
+    if (!items?.length || !danmaku || !animeDanmaku) {
+      timelineCursor.current = videoTime;
+      return;
+    }
+    const previousTime = timelineCursor.current;
+    timelineCursor.current = videoTime;
+    if (previousTime === null) return;
+    const delta = videoTime - previousTime;
+    if (delta <= 0 || delta > 1.8) {
+      emittedTimelineIds.current.clear();
+      return;
+    }
+    const due: PlayerTimelineDanmaku[] = [];
+    for (const item of items) {
+      if (item.time <= previousTime) continue;
+      if (item.time > videoTime) break;
+      if (emittedTimelineIds.current.has(item.id)) continue;
+      emittedTimelineIds.current.add(item.id);
+      due.push(item);
+      if (due.length >= 4) break;
+    }
+    if (emittedTimelineIds.current.size > 400) {
+      emittedTimelineIds.current.clear();
+    }
+    if (due.length) {
+      const shownAt = performance.now();
+      setBursts(previous => [
+        ...previous,
+        ...due.map(item => ({
+          id: `tl-${item.id}-${Math.round(shownAt)}`,
+          text: item.text,
+          lane: lane.current++ % 4,
+          shownAt,
+          customColor: item.color && item.color.toLowerCase() !== '#ffffff' && item.color.toLowerCase() !== '#faf9f5' ? item.color : undefined,
+          pinned: item.mode === 'top' || item.mode === 'bottom' ? item.mode : undefined,
+        })),
+      ].slice(-18));
+    }
+  }, [danmaku, animeDanmaku]);
+
+  const usableDuration = Number.isFinite(duration) ? duration : 0;
 
   function control(action: 'play' | 'pause' | 'seek' | 'rate', value?: number) {
     if (!connected || !media) { acknowledge('请先连接房间并添加片源'); return false; }
@@ -365,28 +483,46 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
     const v = video.current;
     if (!v) return;
     reveal();
+    clearTimeout(endedPauseTimer.current);
     if (needsGesture) {
       v.play().then(() => { gestureBlocked.current = false; setNeedsGesture(false); reportStatus(true); }).catch(() => acknowledge('浏览器未允许播放，请再点击一次'));
       return;
     }
     const action = latest.current.userPaused ? 'play' : 'pause';
-    if (action === 'play') v.play().then(() => { gestureBlocked.current = false; setNeedsGesture(false); reportStatus(); }).catch(() => { gestureBlocked.current = true; setNeedsGesture(true); reportStatus(); });
+    if (action === 'play') {
+      const atEnd = v.ended || (usableDuration > 0 && v.currentTime >= usableDuration - 0.25);
+      if (atEnd) {
+        lastSeekAt.current = performance.now();
+        timelineCursor.current = 0;
+        emittedTimelineIds.current.clear();
+        seekVideo(v, 0);
+        setCurrent(0);
+        control('seek', 0);
+      }
+      v.play().then(() => { gestureBlocked.current = false; setNeedsGesture(false); reportStatus(); }).catch(() => { gestureBlocked.current = true; setNeedsGesture(true); reportStatus(); });
+    }
     if (control(action) && action === 'pause') pauseVideo(v);
   }
   function beginSeek(value: number) {
+    clearTimeout(endedPauseTimer.current);
     dragging.current = true; previewRef.current = value; setPreview(value); reveal();
   }
   function commitSeek() {
     const value = previewRef.current;
     if (value !== null && dragging.current) {
       const target = Math.max(0, Math.min(duration || value, value));
+      timelineCursor.current = target;
+      emittedTimelineIds.current.clear();
       if (control('seek', target) && video.current) { lastSeekAt.current = performance.now(); seekVideo(video.current, target); }
       setCurrent(target);
     }
     dragging.current = false; previewRef.current = null; setPreview(null); reveal();
   }
   function skip(seconds: number) {
+    clearTimeout(endedPauseTimer.current);
     const target = Math.max(0, Math.min(duration || Infinity, (video.current?.currentTime || 0) + seconds));
+    timelineCursor.current = target;
+    emittedTimelineIds.current.clear();
     if (control('seek', target) && video.current) { lastSeekAt.current = performance.now(); seekVideo(video.current, target); }
     reveal(); acknowledge(`${seconds > 0 ? '快进' : '后退'} ${Math.abs(seconds)} 秒`);
   }
@@ -397,10 +533,12 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
   }
   function keydown(event: KeyboardEvent) {
     if (event.defaultPrevented || (event.target as HTMLElement).closest('input,textarea,select,button,[data-voice-controls]')) return;
-    if (event.key === ' ' || event.key.toLowerCase() === 'k') { event.preventDefault(); togglePlay(); }
-    if (event.key === 'ArrowRight') { event.preventDefault(); skip(10); }
-    if (event.key === 'ArrowLeft') { event.preventDefault(); skip(-10); }
-    if (event.key.toLowerCase() === 'f') { event.preventDefault(); void fullscreen(); }
+    if (media?.kind === 'video') {
+      if (event.key === ' ' || event.key.toLowerCase() === 'k') { event.preventDefault(); togglePlay(); }
+      if (event.key === 'ArrowRight') { event.preventDefault(); skip(10); }
+      if (event.key === 'ArrowLeft') { event.preventDefault(); skip(-10); }
+    }
+    if (event.key.toLowerCase() === 'f' && media) { event.preventDefault(); void fullscreen(); }
     if (event.key === 'Escape') { setCinema(false); setWriting(false); setComposerOpen(false); setSettings(false); setDanmakuSettings(false); setReactionsOpen(false); input.current?.blur(); }
   }
   async function exitFullscreen() {
@@ -459,6 +597,10 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
     try { localStorage.setItem(danmakuStorageKey, JSON.stringify(value)); }
     catch { acknowledge('当前浏览器无法保存设置，本次观看仍然生效'); }
   }
+  function toggleAnimeDanmaku(next: boolean) {
+    setAnimeDanmaku(next);
+    saveAnimeDanmakuEnabled(next);
+  }
   function sendReaction(id: typeof reactions[number]['id']) {
     if (send({ type: 'chat', text: reactionText(id) })) { setReactionsOpen(false); acknowledge('表情已发送'); }
     else acknowledge('连接已断开，表情尚未发送');
@@ -475,13 +617,22 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
     } catch (failure) { acknowledge(failure instanceof Error ? failure.message : '无法开启画中画，请在系统浏览器中重试'); }
     reveal();
   }
-  const usableDuration = Number.isFinite(duration) ? duration : 0;
   const progress = usableDuration ? Math.min(100, (preview ?? current) / usableDuration * 100) : 0;
   const driftLabel = drift === null ? '正在校准' : `${drift >= 0 ? '+' : ''}${drift} ms`;
+  const waitingForPeer = Boolean(media?.kind === 'video' && playback?.paused && !userPaused);
+  const blockedWebSelf = Boolean(media?.kind === 'web' && isSameOriginWebUrl(media.url));
   return <div ref={root} className={`watch-player ${immersive ? 'immersive' : ''} ${writing || composerOpen ? 'is-writing' : ''} ${!visible ? 'controls-hidden' : ''}`} style={{ '--visible-height': `${viewport.height}px`, '--visible-top': `${viewport.top}px`, '--danmaku-size': `${preferences.size}px`, '--danmaku-opacity': preferences.opacity, '--danmaku-duration': `${preferences.duration}s`, '--danmaku-color': preferences.color, '--reaction-size': `${preferences.size * 3.5}px` } as CSSProperties} onKeyDown={keydown} tabIndex={0} aria-label="共同播放器">
     <div className="video-stage" onPointerMove={event => { if (event.pointerType === 'mouse') reveal(); }}>
-      {!media ? <div className="player-empty"><div className="projector-illustration" aria-hidden="true" /><h2>准备好，一起开场。</h2><p>添加视频链接，邀请朋友入座。</p><button className="button" disabled={!connected} onClick={() => void changeSource()}>添加片源</button></div> : media.kind === 'web' ? <div className="web-player"><iframe title="共同浏览网页" src={media.url} sandbox="allow-scripts allow-same-origin allow-forms allow-presentation" allow="fullscreen; autoplay" referrerPolicy="no-referrer" /><div className="web-notice">第三方网页中的播放器无法自动同步。<a href={media.url} target="_blank" rel="noreferrer">新窗口打开</a></div></div> : <>
-        <video ref={video} playsInline preload="auto" onTimeUpdate={event => { if (!dragging.current) setCurrent(event.currentTarget.currentTime); }} onDurationChange={event => setDuration(event.currentTarget.duration)} onProgress={event => { const v = event.currentTarget; if (v.buffered.length) setBuffered(v.buffered.end(v.buffered.length - 1)); }} onLoadedMetadata={() => reportStatus(true)} onPlay={() => { clearTimeout(nativePauseTimer.current); nativePauseTimer.current = undefined; setPaused(false); reveal(); if (nativeVideoActive.current && latest.current.userPaused) control('play'); }} onPause={() => {
+      {!media ? <div className="player-empty"><div className="projector-illustration" aria-hidden="true" /><h2>准备好，一起开场。</h2><p>搜索番剧或添加视频直链，邀请朋友入座。</p><button className="button" disabled={!connected} onClick={() => void changeSource()}>选择片源</button></div> : media.kind === 'web' ? blockedWebSelf ? <div className="player-empty"><h2>无法在放映室内嵌入当前站点</h2><p>请更换其他外部 HTTPS 网页地址或选择视频片源。</p><button className="button" disabled={!connected} onClick={() => void changeSource()}>更换片源</button></div> : <div className="web-player"><iframe title="共同浏览网页" src={media.url} sandbox="allow-scripts allow-same-origin allow-forms allow-presentation" allow="fullscreen; autoplay" referrerPolicy="no-referrer" /><div className="web-notice">第三方网页中的播放器无法自动同步。<a href={media.url} target="_blank" rel="noreferrer">新窗口打开</a></div></div> : <>
+        <video ref={video} playsInline preload="auto" onTimeUpdate={event => {
+          const t = event.currentTarget.currentTime;
+          if (!dragging.current) setCurrent(t);
+          if (!event.currentTarget.paused) advanceTimelineDanmaku(t);
+        }} onVolumeChange={event => {
+          const el = event.currentTarget;
+          if (typeof el.volume === 'number' && Number.isFinite(el.volume)) setVolume(el.volume);
+          if (typeof el.muted === 'boolean') setMuted(el.muted);
+        }} onDurationChange={event => setDuration(event.currentTarget.duration)} onProgress={event => { const v = event.currentTarget; if (v.buffered.length) setBuffered(v.buffered.end(v.buffered.length - 1)); }} onLoadedMetadata={() => reportStatus(true)} onPlay={() => { clearTimeout(nativePauseTimer.current); nativePauseTimer.current = undefined; clearTimeout(endedPauseTimer.current); setPaused(false); reveal(); if (nativeVideoActive.current && latest.current.userPaused) control('play'); }} onPause={() => {
           setPaused(true); setVisible(true);
           if (expectedPause.current > 0) { expectedPause.current -= 1; return; }
           const v = video.current;
@@ -498,9 +649,20 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
           }
         }} onWaiting={() => { waitingSince.current ??= performance.now(); clearTimeout(waitingTimer.current); waitingTimer.current = setTimeout(() => reportStatus(), 1250); }} onCanPlay={() => { clearTimeout(waitingTimer.current); reportStatus(); }} onPlaying={() => { gestureBlocked.current = false; setNeedsGesture(false); reportStatus(); }} onSeeked={() => {
           const v = video.current;
+          if (v) {
+            timelineCursor.current = v.currentTime;
+            emittedTimelineIds.current.clear();
+          }
           if (nativeVideoActive.current && v && (scriptedSeek.current === null || Math.abs(v.currentTime - scriptedSeek.current) > 0.1)) control('seek', v.currentTime);
-          scriptedSeek.current = null; reportStatus(true);
-        }} onEnded={() => { control('pause'); setVisible(true); }} onError={event => { if (event.currentTarget.error) { fatalError.current = true; reportStatus(true); setBuffering(false); setError('视频无法加载，请检查片源是否过期或更换链接。'); } }} />
+          scriptedSeek.current = null; reportStatus(false);
+        }} onEnded={() => {
+          setPaused(true);
+          setVisible(true);
+          clearTimeout(endedPauseTimer.current);
+          endedPauseTimer.current = setTimeout(() => {
+            if (video.current?.ended && !latest.current.userPaused) control('pause');
+          }, 1000);
+        }} onError={event => { if (event.currentTarget.error) { fatalError.current = true; reportStatus(true); setBuffering(false); setError('视频无法加载，请检查片源是否过期或更换链接。'); } }} />
         <div className="video-touch" aria-label="轻触显隐，双击播放或暂停" onClick={stageClick} onPointerDown={event => { if (event.pointerType !== 'mouse') touchStart.current = { x: event.clientX, y: event.clientY, position: video.current?.currentTime || 0, moved: false }; }} onPointerMove={event => {
           const start = touchStart.current;
           if (!start || !usableDuration) return;
@@ -510,15 +672,16 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
             beginSeek(Math.min(usableDuration, Math.max(0, start.position + dx / event.currentTarget.clientWidth * 120)));
           }
         }} onPointerUp={event => { if (touchStart.current?.moved) { event.preventDefault(); suppressTapUntil.current = performance.now() + 400; commitSeek(); } touchStart.current = null; }} onPointerCancel={() => { dragging.current = false; previewRef.current = null; setPreview(null); touchStart.current = null; }} />
-        {danmaku && <div className="danmaku" aria-hidden="true">{bursts.map(message => <span className="danmaku-item" key={message.id} style={{ top: findReaction(message.text) ? message.lane % 2 === 0 ? '6%' : preferences.area === 'full' ? 'calc(94% - min(var(--reaction-size), 16cqw))' : 'calc(6% + min(var(--reaction-size), 16cqw) + 8px)' : `${preferences.area === 'full' ? 8 + message.lane * 18 : 6 + message.lane * 10}%` }} onAnimationEnd={() => setBursts(previous => previous.filter(item => item.id !== message.id))}><ReactionContent text={message.text} /></span>)}</div>}
+        {danmaku && <div className="danmaku" aria-hidden="true">{bursts.map(message => <span className={message.pinned ? `danmaku-item danmaku-${message.pinned}` : 'danmaku-item'} key={message.id} style={{ ...(message.customColor ? { color: message.customColor } : {}), top: findReaction(message.text) ? message.lane % 2 === 0 ? '6%' : preferences.area === 'full' ? 'calc(94% - min(var(--reaction-size), 16cqw))' : 'calc(6% + min(var(--reaction-size), 16cqw) + 8px)' : message.pinned === 'bottom' ? `${76 + (message.lane % 2) * 8}%` : `${preferences.area === 'full' ? 8 + message.lane * 18 : 6 + message.lane * 10}%` }} onAnimationEnd={() => setBursts(previous => previous.filter(item => item.id !== message.id))}><ReactionContent text={message.text} /></span>)}</div>}
         <div className="player-top chrome" aria-hidden={!visible} inert={!visible}><button aria-label={fullscreenActive ? fullscreenLabel : '退出沉浸模式'} className="player-icon exit-cinema" onClick={() => void exitFullscreen().catch(() => acknowledge('请使用浏览器返回键退出全屏'))}><ArrowLeft size={22} /></button><strong>{media.title}</strong><span className="sync-indicator" title="本机相对房间时间线的估算偏差">{driftLabel}</span></div>
-        {paused && !buffering && !error && !needsGesture && visible && <button className="center-play" aria-label={userPaused ? '播放电影' : '正在等待对方'} onClick={togglePlay}><Play size={34} fill="currentColor" /></button>}
+        {userPaused && paused && !buffering && !error && !needsGesture && visible && <button className="center-play" aria-label="播放电影" onClick={togglePlay}><Play size={34} fill="currentColor" /></button>}
         {needsGesture && <button className="gesture" onClick={togglePlay}><Play size={23} />点击加入播放</button>}
         {buffering && !error && <div className="buffer-tag" role="status"><span className="spinner" />{userPaused ? '正在加载片源' : '正在缓冲，稍等一下'}</div>}
+        {!buffering && waitingForPeer && !error && <div className="buffer-tag" role="status"><span className="spinner" />正在等待同伴缓冲就绪…</div>}
         {preview !== null && <div className="seek-preview">{formatTime(preview, true)}<small>松手后与对方同步</small></div>}
         <div className="player-bottom chrome" aria-hidden={!visible} inert={!visible} onPointerDown={reveal}>
           <div className="timeline"><div className="buffered-track" style={{ width: `${usableDuration ? Math.min(100, buffered / usableDuration * 100) : 0}%` }} /><input aria-label="播放进度" type="range" min={0} max={usableDuration} step={0.001} value={Math.min(preview ?? current, usableDuration)} style={{ '--progress': `${progress}%` } as CSSProperties} disabled={!usableDuration || !connected} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); beginSeek(Number(event.currentTarget.value)); }} onChange={event => beginSeek(Number(event.target.value))} onPointerUp={commitSeek} onPointerCancel={() => { dragging.current = false; previewRef.current = null; setPreview(null); }} onKeyUp={event => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) commitSeek(); }} onBlur={() => { if (dragging.current) commitSeek(); }} /></div>
-          <div className="control-row"><button className="player-icon" aria-label={userPaused ? '播放' : '暂停'} onClick={togglePlay}>{paused ? <Play size={23} fill="currentColor" /> : <Pause size={23} fill="currentColor" />}</button><button className="player-icon skip" aria-label="后退10秒" onClick={() => skip(-10)}><RotateCcw size={20} /></button><button className="player-icon skip" aria-label="快进10秒" onClick={() => skip(10)}><RotateCw size={20} /></button><span className="play-time">{formatTime(preview ?? current)}<i>/</i>{formatTime(duration)}</span><div className="control-spacer" /><button className="player-text write-trigger" onClick={openComposer}><MessageSquare size={17} /><span>发弹幕</span></button><button className={`player-text danmaku-toggle ${danmaku ? 'active' : ''}`} aria-label="弹幕显示开关" aria-pressed={danmaku} onClick={() => { setDanmaku(value => !value); reveal(); }}>弹</button><button className="player-text" aria-label="播放设置" aria-expanded={settings} onClick={() => { setSettings(value => !value); setDanmakuSettings(false); setReactionsOpen(false); reveal(); }}>{playback?.rate || 1}×<ChevronDown size={12} /></button>{pipAvailable && <button className={`player-text pip-button ${pipActive ? 'active' : ''}`} aria-label={pipActive ? '退出画中画' : '画中画'} aria-pressed={pipActive} onClick={() => void pictureInPicture()}><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><rect x="11" y="11" width="7" height="6" rx="1" fill="currentColor" stroke="none" /></svg></button>}<button className="player-icon volume-button" aria-label={muted ? '取消静音' : '静音'} onClick={() => { if (video.current) video.current.muted = !muted; setMuted(!muted); }}>{muted ? <VolumeX size={20} /> : <Volume2 size={20} />}</button><button className="player-icon" aria-label={fullscreenLabel} onClick={() => void fullscreen()}>{fullscreenActive ? <Minimize size={21} /> : <Maximize size={21} />}</button></div>
+          <div className="control-row"><button className="player-icon" aria-label={userPaused ? '播放' : '暂停'} onClick={togglePlay}>{userPaused ? <Play size={23} fill="currentColor" /> : <Pause size={23} fill="currentColor" />}</button><button className="player-icon skip" aria-label="后退10秒" onClick={() => skip(-10)}><RotateCcw size={20} /></button><button className="player-icon skip" aria-label="快进10秒" onClick={() => skip(10)}><RotateCw size={20} /></button><span className="play-time">{formatTime(preview ?? current)}<i>/</i>{formatTime(duration)}</span><div className="control-spacer" /><button className="player-text write-trigger" onClick={openComposer}><MessageSquare size={17} /><span>发弹幕</span></button><button className={`player-text danmaku-toggle ${danmaku ? 'active' : ''}`} aria-label="弹幕显示开关" aria-pressed={danmaku} onClick={() => { setDanmaku(value => !value); reveal(); }}>弹</button><button className="player-text" aria-label="播放设置" aria-expanded={settings} onClick={() => { setSettings(value => !value); setDanmakuSettings(false); setReactionsOpen(false); reveal(); }}>{playback?.rate || 1}×<ChevronDown size={12} /></button>{pipAvailable && <button className={`player-text pip-button ${pipActive ? 'active' : ''}`} aria-label={pipActive ? '退出画中画' : '画中画'} aria-pressed={pipActive} onClick={() => void pictureInPicture()}><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><rect x="11" y="11" width="7" height="6" rx="1" fill="currentColor" stroke="none" /></svg></button>}<button className="player-icon volume-button" aria-label={muted ? '取消静音' : '静音'} onClick={() => { if (video.current) video.current.muted = !muted; setMuted(!muted); }}>{muted ? <VolumeX size={20} /> : <Volume2 size={20} />}</button><button className="player-icon" aria-label={fullscreenLabel} onClick={() => void fullscreen()}>{fullscreenActive ? <Minimize size={21} /> : <Maximize size={21} />}</button></div>
         </div>
         {settings && <div className="player-settings"><div className="settings-heading">播放设置<button className="player-icon" aria-label="关闭播放设置" onClick={() => setSettings(false)}><X size={17} /></button></div><span>倍速（双方同步）</span><div className="rate-options">{[0.5, 0.75, 1, 1.25, 1.5, 2].map(rate => <button key={rate} className={playback?.rate === rate ? 'selected' : ''} onClick={() => { control('rate', rate); setSettings(false); reveal(); }}>{rate}×</button>)}</div><label className="volume-range">音量<input type="range" aria-label="音量" min={0} max={1} step={0.05} value={volume} onChange={event => { const value = Number(event.target.value); setVolume(value); if (video.current) { video.current.volume = value; video.current.muted = value === 0; } setMuted(value === 0); }} /></label><div className="sync-detail"><span>本机对房间时间线<strong>{driftLabel}</strong></span><span>两端进度差（估算）<strong>{peerDrift === null ? '等待对方数据' : `${Math.abs(peerDrift)} ms`}</strong></span><small>网络、解码和视频帧率会影响实际误差。</small></div><button className="sync-now" onClick={() => { pendingAlignment.current = true; send({ type: 'sync' }); acknowledge('正在重新校准'); }}>立即校准<Check size={15} /></button></div>}
       </>}
@@ -532,7 +695,7 @@ export default function Player({ media, playback, userPaused, serverNow, clockRe
       <button type="button" className={`composer-tool danmaku-preferences ${danmakuSettings ? 'selected' : ''}`} aria-label="弹幕偏好" aria-expanded={danmakuSettings} onPointerDown={event => event.preventDefault()} onClick={() => { setDanmakuSettings(value => !value); setReactionsOpen(false); setSettings(false); reveal(); }}>弹</button>
     </form>
     {reactionsOpen && <section className="reaction-picker" role="dialog" aria-label="快捷表情"><div className="picker-heading"><strong>把感受发给对方</strong><button type="button" className="composer-tool" aria-label="关闭快捷表情" onClick={() => setReactionsOpen(false)}><X size={17} /></button></div><div className="reaction-grid">{reactions.map(reaction => <button type="button" key={reaction.id} aria-label={`发送表情：${reaction.label}`} title={reaction.label} disabled={!connected} onPointerDown={event => event.preventDefault()} onClick={() => sendReaction(reaction.id)}><img src={reaction.image} width="64" height="64" alt="" draggable={false} /><span>{reaction.label}</span></button>)}</div></section>}
-    {danmakuSettings && <section className="danmaku-preferences-panel" role="dialog" aria-label="弹幕偏好"><div className="picker-heading"><strong>弹幕偏好</strong><button type="button" className="composer-tool" aria-label="关闭弹幕偏好" onClick={() => setDanmakuSettings(false)}><X size={17} /></button></div><p>只改变你的画面，设置会保存在当前浏览器。</p><label className="preference-range">字号<span>{preferences.size}px</span><input aria-label="弹幕字号" type="range" min="16" max="32" step="1" value={preferences.size} onChange={event => updatePreferences({ ...preferences, size: Number(event.target.value) })} /></label><label className="preference-range">透明度<span>{Math.round(preferences.opacity * 100)}%</span><input aria-label="弹幕透明度" type="range" min="0.25" max="1" step="0.05" value={preferences.opacity} onChange={event => updatePreferences({ ...preferences, opacity: Number(event.target.value) })} /></label><label className="preference-range">停留时间<span>{preferences.duration}秒</span><input aria-label="弹幕停留时间" type="range" min="5" max="14" step="1" value={preferences.duration} onChange={event => updatePreferences({ ...preferences, duration: Number(event.target.value) })} /></label><fieldset className="preference-options"><legend>显示区域</legend>{([{ value: 'top', label: '画面上方' }, { value: 'full', label: '整个画面' }] as const).map(area => <button type="button" aria-pressed={preferences.area === area.value} key={area.value} onClick={() => updatePreferences({ ...preferences, area: area.value })}>{area.label}</button>)}</fieldset><fieldset className="preference-options preference-colors"><legend>文字颜色</legend>{danmakuColors.map(color => <button type="button" aria-label={color.label} aria-pressed={preferences.color === color.value} key={color.value} style={{ '--swatch': color.value } as CSSProperties} onClick={() => updatePreferences({ ...preferences, color: color.value })}><i />{color.label}</button>)}</fieldset><div className="preference-footer"><button type="button" onClick={() => { setDanmaku(value => !value); reveal(); }}>{danmaku ? '关闭弹幕' : '开启弹幕'}</button><button type="button" onClick={() => updatePreferences({ ...defaultDanmaku })}>恢复默认</button></div></section>}
+    {danmakuSettings && <section className="danmaku-preferences-panel" role="dialog" aria-label="弹幕偏好"><div className="picker-heading"><strong>弹幕偏好</strong><button type="button" className="composer-tool" aria-label="关闭弹幕偏好" onClick={() => setDanmakuSettings(false)}><X size={17} /></button></div><p>只改变你的画面，设置会保存在当前浏览器。</p>{Boolean(timelineDanmaku?.length || media?.anime) && <fieldset className="preference-options"><legend>番剧时间轴弹幕{timelineDanmaku?.length ? `（已装填 ${timelineDanmaku.length} 条）` : ''}</legend><button type="button" aria-pressed={animeDanmaku} onClick={() => toggleAnimeDanmaku(true)}>开启</button><button type="button" aria-pressed={!animeDanmaku} onClick={() => toggleAnimeDanmaku(false)}>关闭</button></fieldset>}<label className="preference-range">字号<span>{preferences.size}px</span><input aria-label="弹幕字号" type="range" min="16" max="32" step="1" value={preferences.size} onChange={event => updatePreferences({ ...preferences, size: Number(event.target.value) })} /></label><label className="preference-range">透明度<span>{Math.round(preferences.opacity * 100)}%</span><input aria-label="弹幕透明度" type="range" min="0.25" max="1" step="0.05" value={preferences.opacity} onChange={event => updatePreferences({ ...preferences, opacity: Number(event.target.value) })} /></label><label className="preference-range">停留时间<span>{preferences.duration}秒</span><input aria-label="弹幕停留时间" type="range" min="5" max="14" step="1" value={preferences.duration} onChange={event => updatePreferences({ ...preferences, duration: Number(event.target.value) })} /></label><fieldset className="preference-options"><legend>显示区域</legend>{([{ value: 'top', label: '画面上方' }, { value: 'full', label: '整个画面' }] as const).map(area => <button type="button" aria-pressed={preferences.area === area.value} key={area.value} onClick={() => updatePreferences({ ...preferences, area: area.value })}>{area.label}</button>)}</fieldset><fieldset className="preference-options preference-colors"><legend>文字颜色</legend>{danmakuColors.map(color => <button type="button" aria-label={color.label} aria-pressed={preferences.color === color.value} key={color.value} style={{ '--swatch': color.value } as CSSProperties} onClick={() => updatePreferences({ ...preferences, color: color.value })}><i />{color.label}</button>)}</fieldset><div className="preference-footer"><button type="button" onClick={() => { setDanmaku(value => !value); reveal(); }}>{danmaku ? '关闭弹幕' : '开启弹幕'}</button><button type="button" onClick={() => updatePreferences({ ...defaultDanmaku })}>恢复默认</button></div></section>}
     {voiceControls && <div className="immersive-voice-controls" data-voice-controls>{voiceControls}</div>}
   </div>;
 }

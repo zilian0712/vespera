@@ -80,8 +80,13 @@ async function hookHarness() {
     timers.set(id, { due: local + delay, delay, repeat, callback });
     return id;
   };
+  let probeHandler: (url: URL) => Promise<{ status: number; json: () => Promise<unknown> }> = async () => ({
+    status: 503,
+    json: async () => ({}),
+  });
   replace('__roomTestHooks', hooks);
   replace('WebSocket', MockSocket);
+  replace('fetch', (input: URL | string) => probeHandler(new URL(String(input))));
   replace('performance', { now: () => local });
   replace('sessionStorage', { getItem: () => 'self', setItem() {} });
   replace('location', { origin: 'https://watch.test' });
@@ -165,6 +170,9 @@ async function hookHarness() {
       },
       pageshow: () => browser.dispatchEvent(new Event('pageshow')),
       setProps: (...next: string[]) => { props = next; },
+      setProbe: (status: number, message = '') => {
+        probeHandler = async () => ({ status, json: async () => (message ? { error: { message } } : {}) });
+      },
       telemetry: (overrides = {}) => ({
         type: 'telemetry', clientId: 'peer', position: 10.123, paused: false, rate: 1.05,
         revision: 1, measuredAt: epoch + local, receivedAt: epoch + local, ...overrides,
@@ -179,7 +187,7 @@ async function hookHarness() {
   }
 }
 
-test('useRoom calibrates a stable clock and leaves capacity for telemetry and controls', async () => {
+test('useRoom calibrates a stable clock and leaves capacity for telemetry and controls without redundant snapshot polling', async () => {
   const harness = await hookHarness();
   try {
     const initial = harness.render();
@@ -203,8 +211,7 @@ test('useRoom calibrates a stable clock and leaves capacity for telemetry and co
     const pings = socket.messages.filter(message => message.data.type === 'ping');
     assert.equal(pings.length, 7);
     const syncs = socket.messages.filter(message => message.data.type === 'sync');
-    assert.ok(syncs.length >= 20);
-    assert.equal(syncs[1].at - syncs[0].at, 1500);
+    assert.equal(syncs.length, 0);
     const window = { start: 0, count: 0 };
     for (const message of socket.messages) assert.equal(consumeRateLimit(window, message.at), true);
   } finally { harness.restore(); }
@@ -400,5 +407,41 @@ test('changing rooms cleans the previous connection and a silent socket reconnec
     assert.equal(harness.render().connection, '重新连接');
     harness.advance(800);
     assert.equal(harness.sockets.length, 3);
+  } finally { harness.restore(); }
+});
+
+test('pre-upgrade HTTP 403/409/410 terminal status stops infinite reconnects and supports clearError', async () => {
+  const harness = await hookHarness();
+  try {
+    harness.setProbe(409, '房间最多容纳两位成员');
+    harness.render();
+    const first = harness.sockets[0];
+    first.onerror?.();
+    first.close(1006, '');
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    const state = harness.render();
+    assert.equal(state.connection, '连接已关闭');
+    assert.equal(state.error, '房间最多容纳两位成员');
+    harness.advance(60000);
+    assert.equal(harness.sockets.length, 1);
+    state.clearError();
+    assert.equal(harness.render().error, '');
+  } finally { harness.restore(); }
+});
+
+test('renaming nickname sends a live profile update without closing or recreating the WebSocket', async () => {
+  const harness = await hookHarness();
+  try {
+    harness.render();
+    const socket = harness.sockets[0];
+    socket.open();
+    socket.receive(harness.snapshot());
+    harness.setProps('room-a', 'invite', 'Alicia');
+    harness.render();
+    assert.equal(harness.sockets.length, 1);
+    assert.equal(socket.readyState, 1);
+    const profiles = socket.messages.filter(message => message.data.type === 'profile');
+    assert.deepEqual(profiles.map(item => item.data), [{ type: 'profile', name: 'Alicia' }]);
   } finally { harness.restore(); }
 });

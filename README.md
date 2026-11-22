@@ -36,22 +36,23 @@
 
 | 功能 | 说明 |
 | --- | --- |
-| 双人同步观影 | 支持 MP4 直链和 HLS（M3U8），同步播放、暂停、跳转和倍速；可开启「缓冲时等对方」。 |
-| 聊天与弹幕 | 支持文字和 12 个图像表情。弹幕字号、透明度、停留时间、区域与颜色可调，偏好只保存在当前浏览器。 |
-| 语音连麦 | 双方启用语音后，一方呼叫、另一方接听，持续通话。 |
+| 双人同步观影 | 支持 MP4 直链和按需加载的 HLS（M3U8），同步播放、暂停、跳转、结尾重播和倍速；可开启「缓冲时等对方」。 |
+| 番剧片库与选集 | 内置番剧最近更新、分类索引、关键词搜索、分集与多线路选择；房间内支持一键切换上一话 / 下一话 / 播放线路。 |
+| 聊天与双轨弹幕 | 支持实时双人聊天弹幕、12 个图像表情，以及番剧时间轴同步弹幕（自动聚合 AniCh / Bilibili / 腾讯时间轴弹幕，可在弹幕偏好中独立开关）。 |
+| 语音连麦 | 双方启用语音后，一方呼叫、另一方接听，持续通话；房间内改名不会中断语音。 |
 | 按住对讲 | 双方切到对讲模式并开启收听，按住说话、松开停止发送；接收消息不会自动打开麦克风。 |
 | 多端观看 | 手机与电脑布局、全屏控件，以及浏览器支持时的视频画中画。 |
 | 私人房间 | 无账号系统，邀请链接包含入房凭据；最多两位成员，房间创建后 24 小时过期。 |
 
-双方分别从原片源加载视频，服务端只传递房间状态、播放指令和聊天内容，不代理或托管视频文件。项目不提供影视资源库，需要自行准备双方都有权访问的片源。
+双方分别从原片源加载视频，服务端只传递房间状态、播放指令、聊天内容及番剧元数据/弹幕解析，不代理或托管视频流文件。除内置番剧检索外，也可以直接粘贴双方都有权访问的 HTTPS 视频直链。
 
 ## 怎么一起看
 
 1. 打开站点，创建房间，设置自己的昵称。
 2. 复制邀请链接发给对方，等待对方进入。
-3. 在选片入口填入可播放的 HTTPS 视频地址，支持 MP4 或 M3U8。
-4. 开始播放。任意一方的播放、暂停、跳转和倍速操作会同步给另一方。
-5. 按需开启弹幕、语音或「缓冲时等对方」。建议戴耳机使用语音。
+3. 在选片入口可以直接浏览/搜索「番剧片库」挑选集数与线路，也可以切换到「视频直链」填入 HTTPS MP4 / M3U8 地址。
+4. 开始播放。任意一方的播放、暂停、跳转、切换集数和倍速操作会同步给另一方。
+5. 按需开启实时弹幕、番剧时间轴弹幕、语音或「缓冲时等对方」。建议戴耳机使用语音。
 
 网页浏览模式只能嵌入允许被嵌入的页面，不能同步第三方网页内部播放器的播放进度；一起看视频时优先使用视频直链。
 
@@ -109,20 +110,14 @@ npx wrangler deploy --config wrangler.local.jsonc
 npm ci
 ```
 
-在第一个终端构建静态资源并启动 Worker：
+可一键同时启动本地 Worker 与 Vite 前端：
 
 ```sh
 npm run build
-npm run dev:worker
+npm run dev:all
 ```
 
-在第二个终端启动前端：
-
-```sh
-npm run dev
-```
-
-打开 Vite 输出的地址。默认开发代理将 `/api` 和 WebSocket 转发到 `http://127.0.0.1:8787`，两个进程需要同时运行。
+也可以在两个终端分别运行 `npm run dev:worker` 与 `npm run dev`。默认开发代理将 `/api`（含房间接口、番剧网关和 WebSocket）转发到 `http://127.0.0.1:8787`。
 
 环境配置示例见 [.env.example](.env.example) 和 [.dev.vars.example](.dev.vars.example)。需要时分别复制为 `.env.local` 和 `.dev.vars`，编辑后重启开发进程。已有 `.env.local` 时检查 `DEV_API_ORIGIN`，连接本地 Worker 应使用 `http://127.0.0.1:8787`。
 
@@ -135,30 +130,42 @@ npm run dev
 | `DEV_API_ORIGIN` | Vite 开发服务器 | 后端地址，默认 `http://127.0.0.1:8787`。通过 `.env` / `.env.local` 或命令行设置，不注入前端产物。 |
 | `VITE_API_BASE` | 前端构建 | 默认留空，使用页面同源 API。分开部署时填写后端完整 Origin；此值公开，不可放入密钥。 |
 | `ALLOWED_ORIGIN` | Worker | 默认只接受同源来源。可额外允许一个前端精确 Origin，包含协议、主机和可选端口，不含路径或末尾斜杠。 |
+| `ANICH_API_BASE` | Worker | 可选，番剧接口镜像地址列表（多个用英文逗号分隔，按顺序自动降级）。 |
+| `ANICH_USER_AGENT` | Worker | 可选，请求上游番剧接口时的 `User-Agent`（默认 `cx.xs.open Android 1.0.0`）。 |
+| `ANICH_BILI_DANMAKU_BASE` | Worker | 可选，Bilibili Protobuf 分片弹幕代理源地址。 |
+| `ANICH_QQ_DANMAKU_BASE` | Worker | 可选，腾讯时间轴弹幕接口源地址。 |
 
 同源部署和默认开发代理通常不需要设置 `ALLOWED_ORIGIN`。前后端分开部署时，同时设置 `VITE_API_BASE` 与 Worker 的 `ALLOWED_ORIGIN`。开发代理保留 WebSocket 转发及 Origin 改写。
 
 ### 检查命令
 
 ```sh
+npm run check
+```
+
+等价于依次执行全量类型检查（前端 + Worker + 测试套件）、自动化测试与生产构建：
+
+```sh
+npm run check:types
 npm test
 npm run build
-npm run check:worker
 ```
+
+部署后如需对线上站点执行真实 WebSocket 回归验证，可设置 `TEST_BASE` 运行 `npm run test:live`。
 
 [检查工作流](.github/workflows/check.yml) 在推送和 Pull Request 时运行以上检查；[部署工作流](.github/workflows/deploy.yml) 仅手动触发。自动检查不能代替跨设备播放、真实麦克风、画中画和移动设备的人工验收。
 
 ## 技术结构
 
-- **前端：** React 19、TypeScript、Vite、hls.js、Lucide。
-- **房间后端：** Cloudflare Workers 与 SQLite-backed Durable Objects，每个房间独立维护状态，通过 WebSocket 广播。
-- **语音：** PeerJS 与浏览器 WebRTC，公共 PeerServer 负责连接协商，音频通过 P2P 传输。
+- **前端：** React 19、TypeScript、Vite、按需拆包加载的 hls.js、Lucide。
+- **房间与番剧网关：** Cloudflare Workers 与 SQLite-backed Durable Objects。每个房间独立维护同步状态与聊天记录；`/api/anime/*` 网关内置零依赖 Protobuf 解码器、VOD 混淆地址还原、多镜像自动故障转移与多源时间轴弹幕归一化。
+- **语音：** PeerJS 与浏览器 WebRTC，公共 PeerServer 负责连接协商，DTLS 指纹 + HMAC 双向鉴权，音频通过 P2P 传输。
 
 | 路径 | 内容 |
 | --- | --- |
-| [src/](src/) | 页面、播放器、聊天、同步与语音逻辑。 |
-| [worker/](worker/) | 房间 API、WebSocket、状态存储与输入校验。 |
-| [tests/](tests/) | 自动测试、线上回归脚本与本地验证页面。 |
+| [src/](src/) | 页面、番剧片库选择器、同步播放器、双轨弹幕、同步数学与安全语音逻辑。 |
+| [worker/](worker/) | 房间 API、预检状态探测、WebSocket、Durable Object 状态存储、番剧网关与 Protobuf 解码。 |
+| [tests/](tests/) | 单元/集成测试、Worker 路由与番剧协议测试、线上回归脚本与本地验证页面。 |
 | [.github/workflows/](.github/workflows/) | 持续检查与手动部署工作流。 |
 | [docs/screenshots/](docs/screenshots/) | README 演示截图。 |
 

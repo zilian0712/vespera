@@ -34,3 +34,26 @@ export function loadDanmaku(): DanmakuPreferences {
     return parseDanmaku(JSON.parse(localStorage.getItem(danmakuStorageKey) || 'null'));
   } catch { return { ...defaultDanmaku }; }
 }
+
+export const animeDanmakuStorageKey = 'zhima-anime-danmaku';
+
+export function loadAnimeDanmakuEnabled(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return true;
+    const raw = localStorage.getItem(animeDanmakuStorageKey);
+    if (raw === null) return true;
+    return raw !== '0' && raw !== 'false';
+  } catch {
+    return true;
+  }
+}
+
+export function saveAnimeDanmakuEnabled(enabled: boolean): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(animeDanmakuStorageKey, enabled ? '1' : '0');
+    }
+  } catch {
+    // Ignore storage quota or private-mode restrictions.
+  }
+}

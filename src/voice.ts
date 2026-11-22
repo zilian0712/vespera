@@ -82,7 +82,7 @@ export async function deriveVoiceIdentity(options: Pick<VoiceOptions, 'roomId' |
 }
 
 function fingerprint(description: RTCSessionDescription | RTCSessionDescriptionInit | null) {
-  const matches = [...(description?.sdp || '').matchAll(/^a=fingerprint:sha-256 ([\dA-Fa-f:]+)\r?$/gm)];
+  const matches = [...(description?.sdp || '').matchAll(/^a=fingerprint:sha-256\s+([\dA-Fa-f:]+)\r?$/gim)];
   const values = [...new Set(matches.map(match => match[1].replaceAll(':', '').toLowerCase()))];
   return values.length === 1 && identifier(values[0]) ? values[0] : '';
 }
